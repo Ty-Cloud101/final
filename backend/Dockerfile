@@ -5,12 +5,12 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --production
 
-# Copy only what's needed (not everything)
+# Copy server.js AND src folder
+COPY server.js ./
 COPY src/ ./src/
 
 EXPOSE 5000
 
-# Add non-root user for security
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
 
