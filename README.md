@@ -100,7 +100,8 @@ Frontend Logs are edge/server logs:
 From repository root:
 
 ```bash
-docker compose up -d --build
+#test
+docker compose up -d --build 
 ```
 
 Open:
