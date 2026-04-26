@@ -14,4 +14,4 @@ EXPOSE 5000
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
 
-CMD ["node", "index.js"]
+CMD ["node", "server.js"]
