@@ -1,0 +1,233 @@
+pipeline {
+    agent any
+
+    environment {
+        // AWS credentials (hardcoded for testing only)
+        AWS_ACCESS_KEY_ID     = '<REDACTED>'
+        AWS_SECRET_ACCESS_KEY = '<REDACTED>'
+        AWS_DEFAULT_REGION    = 'us-east-1'
+        EC2_USER              = 'ubuntu'
+        SSH_KEY               = '/var/lib/jenkins/.ssh/id_rsa'
+
+        // SonarQube
+        SCANNER_HOME = tool(name: 'SonarScanner', type: 'hudson.plugins.sonar.SonarRunnerInstallation')
+
+        // Docker
+        IMAGE_NAME     = 'honeypot-backend'
+        CONTAINER_NAME = 'honeypot-backend'
+        APP_PORT       = '5000'
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────
+        // STAGE 1 — Pull source code from GitHub
+        // ─────────────────────────────────────────────
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/Ty-Cloud101/final.git'
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 2 — Install backend dependencies
+        // ─────────────────────────────────────────────
+        stage('Install Backend Dependencies') {
+            steps {
+                dir('backend') {
+                    sh 'npm install'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 3 — SonarQube code quality scan
+        // ─────────────────────────────────────────────
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                        -Dsonar.projectKey=honeypot \
+                        -Dsonar.projectName=honeypot \
+                        -Dsonar.projectVersion=1.0 \
+                        -Dsonar.sources=backend \
+                        -Dsonar.sourceEncoding=UTF-8 \
+                        -Dsonar.exclusions=**/node_modules/**,**/logs/**,**/build/**,**/dist/**
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 4 — Wait for SonarQube Quality Gate
+        //           Pipeline FAILS here if gate fails
+        // ─────────────────────────────────────────────
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 5 — Trivy filesystem / dependency scan
+        //           Pipeline FAILS if CRITICAL found
+        // ─────────────────────────────────────────────
+        stage('Trivy Filesystem Scan') {
+            steps {
+                sh '''
+                    docker volume create trivy-cache || true
+                    docker run --rm \
+                      -v trivy-cache:/root/.cache/trivy \
+                      -v "$WORKSPACE:/src" \
+                      aquasec/trivy:0.69.3 fs \
+                      --severity CRITICAL \
+                      --exit-code 1 \
+                      /src
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 6 — Build Docker image
+        // ─────────────────────────────────────────────
+        stage('Build Docker Image') {
+            steps {
+                sh "docker build -t ${IMAGE_NAME}:latest ./backend"
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 7 — Trivy Docker image scan
+        //           Pipeline FAILS if CRITICAL found
+        // ─────────────────────────────────────────────
+        stage('Trivy Image Scan') {
+            steps {
+                sh """
+                    docker run --rm \
+                      -v trivy-cache:/root/.cache/trivy \
+                      -v /var/run/docker.sock:/var/run/docker.sock \
+                      aquasec/trivy:0.69.3 image \
+                      --severity CRITICAL \
+                      --exit-code 1 \
+                      ${IMAGE_NAME}:latest
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 8 — Terraform: provision EC2
+        // ─────────────────────────────────────────────
+        stage('Terraform Init') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform init'
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform apply -auto-approve'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 9 — Get the new EC2 public IP
+        // ─────────────────────────────────────────────
+        stage('Get EC2 Public IP') {
+            steps {
+                script {
+                    env.EC2_IP = sh(
+                        script: 'cd terraform && terraform output -raw ec2_public_ip',
+                        returnStdout: true
+                    ).trim()
+                    echo "EC2 Public IP: ${env.EC2_IP}"
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 10 — Wait for EC2 to boot
+        // ─────────────────────────────────────────────
+        stage('Wait for EC2') {
+            steps {
+                sh 'sleep 60'
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 11 — Install Docker on the new EC2
+        // ─────────────────────────────────────────────
+        stage('Install Docker on EC2') {
+            steps {
+                sh """
+                    ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ${EC2_USER}@${env.EC2_IP} '
+                        curl -fsSL https://get.docker.com | sh
+                        sudo systemctl enable docker
+                        sudo systemctl start docker
+                        sudo usermod -aG docker ${EC2_USER} || true
+                        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+                        sudo apt-get install -y nodejs
+                    '
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 12 — Copy app files to EC2
+        // ─────────────────────────────────────────────
+        stage('Copy App to EC2') {
+            steps {
+                sh """
+                    ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ${EC2_USER}@${env.EC2_IP} '
+                        rm -rf /home/ubuntu/honeypot
+                        mkdir -p /home/ubuntu/honeypot
+                    '
+                    rsync -av --exclude='.git' --exclude='node_modules' \
+                      ./ ${EC2_USER}@${env.EC2_IP}:/home/ubuntu/honeypot
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // STAGE 13 — Deploy container on EC2
+        // ─────────────────────────────────────────────
+        stage('Deploy Container on EC2') {
+            steps {
+                sh """
+                    ssh -o StrictHostKeyChecking=no -i ${SSH_KEY} ${EC2_USER}@${env.EC2_IP} '
+                        cd /home/ubuntu/honeypot
+                        sudo docker rm -f ${CONTAINER_NAME} || true
+                        sudo docker build -t ${IMAGE_NAME}:latest ./backend
+                        sudo docker run -d \\
+                          --name ${CONTAINER_NAME} \\
+                          --restart unless-stopped \\
+                          -p ${APP_PORT}:${APP_PORT} \\
+                          --user root \\
+                          ${IMAGE_NAME}:latest
+                    '
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "=========================================="
+            echo " Pipeline completed successfully!"
+            echo " Application URL: http://${env.EC2_IP}:${APP_PORT}"
+            echo "=========================================="
+        }
+        failure {
+            echo "Pipeline FAILED. Check the stage logs above."
+        }
+        always {
+            echo 'Pipeline execution finished.'
+        }
+    }
+}
